@@ -1,0 +1,7 @@
+# 阶段一依赖。建议装进你已有的 FoundationPose conda 环境（里面已经装了大部分）。
+# 安装：/home/qyx/anaconda3/envs/FoundationPose/bin/pip install -r requirements.txt
+opencv-python>=4.8
+pyrealsense2>=2.54
+openai>=1.40
+numpy
+pyyaml

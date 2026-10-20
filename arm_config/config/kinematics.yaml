@@ -1,0 +1,26 @@
+arm:
+  kinematics_solver: pick_ik/PickIkPlugin
+  kinematics_solver_timeout: 10.0
+
+  # pick_ik 核心模式：
+  #   position_only_ik: true  → 只约束末端位置，完全不要求姿态，成功率最高
+  #   position_only_ik: false → 同时约束位置+姿态（默认）
+  position_only_ik: false
+
+  # 局部优化阶段（梯度下降），快速精化解
+  mode: global            # global: 先全局随机搜索再局部优化，解质量更好；local: 只做局部，速度更快
+
+  # pick_ik 求解容忍度（阈值）
+  # 适当放宽这两个参数，可以让求解器在接近目标时就认为"已找到有效解"，极大提高求解成功率
+  position_threshold: 0.005      # 位置误差容忍度（默认 0.001 米），放宽到 5mm
+  orientation_threshold: 0.2     # 姿态误差容忍度（默认 0.01 弧度），放宽到 0.2 弧度（约 11.4 度）
+
+  # 近似 IK：允许在找不到精确解时返回误差最小的近似解
+  stop_optimization_on_valid_solution: true  # false = 继续优化直到超时，取最优近似解
+
+  # 姿态误差权重（position_only_ik=false 时生效）
+  # 降低 rotation_scale 可以让求解器优先满足位置，容忍更大姿态偏差
+  rotation_scale: 0.2     # 0.0=完全忽略姿态, 1.0=姿态与位置等权重
+
+  # 全局随机搜索参数
+  gd_step_size: 0.0001

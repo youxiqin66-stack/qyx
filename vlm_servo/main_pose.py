@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""阶段三入口：VLM bbox -> FoundationPose -> 目标 6D Pose（相机系）。
+
+链路：
+  自然语言 -> VLM(bbox) -> 掩码(rect/sam) -> FoundationPose register(首帧)
+  -> track(连续) -> 4x4 位姿(物体在相机系) -> 画 3D 框 + 坐标轴
+
+本阶段不接 ROS2/MoveIt2，只输出 6D Pose 并可视化。
+位姿坐标系 = camera_color_optical_frame（与你 ros_demo.py / POSE_TRANSFORM_GUIDE.md 一致）。
+
+线程分工：FoundationPose 的构建/register/track 全部在显示线程串行执行，
+避免多线程同时用同一个 CUDA 上下文：
+  - 输入线程：终端指令 -> VLM -> bbox -> 掩码 -> 交给显示线程注册
+  - 显示线程：抓帧 -> (REGISTERING 时) register -> (TRACKING 时) track -> 画图
+"""
+
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+
+import cv2
+
+from config import load_config
+from camera import build_camera
+from visualizer import draw_hud, FpsCounter
+from vlm import build_vlm
+from mask_gen import mask_from_bbox
+from foundationpose_bridge import PoseEstimator, K_dict_to_matrix, match_mesh
+from pose_pub import PosePublisher
+
+# 临时调试：VLM 没检出目标时把当前帧落盘，便于离线查「为什么没认出来」。
+# 不需要时把 DEBUG_DUMP_MISS 设为 False（或删掉这个函数和它的调用）即可。
+DEBUG_DUMP_MISS = True
+_DEBUG_DIR = "/tmp/vlm_servo_debug"
+
+
+def dump_missed_frame(color, depth, instruction):
+    """存下没检出目标的这一帧（图 + 深度 + 一句话说明）。"""
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        base = os.path.join(_DEBUG_DIR, time.strftime("miss_%Y%m%d-%H%M%S"))
+        cv2.imwrite(base + ".jpg", color)
+        if depth is not None:
+            np.save(base + "_depth.npy", depth)
+        with open(base + ".txt", "w", encoding="utf-8") as f:
+            f.write(f"instruction: {instruction}\n")
+            f.write(f"color shape: {color.shape}\n")
+            if depth is not None:
+                valid = depth[(depth > 0.1) & (depth < 3.0)]
+                rng = (f"{valid.min():.3f}~{valid.max():.3f} m"
+                       if valid.size else "无有效深度")
+                f.write(f"depth 有效像素: {valid.size}, 范围 {rng}\n")
+        print(f"    [debug] 已存下这一帧: {base}.jpg")
+    except Exception as e:  # noqa: BLE001
+        print(f"    [debug] 存帧失败: {e}")
+
+
+def main():
+    cfg = load_config()
+    camera = build_camera(cfg["camera"])
+    vlm = build_vlm(cfg["vlm"])
+    disp = cfg.get("display", {})
+    fp_cfg = cfg.get("foundationpose", {})
+
+    win_name = disp.get("window_name", "VLM Servo - Phase 3")
+    show_fps = bool(disp.get("show_fps", True))
+
+    fp_dir = fp_cfg.get("fp_dir", "/home/qyx/LLM/code/FoundationPose")
+    os.environ.setdefault("FOUNDATIONPOSE_DIR", fp_dir)
+    mask_mode = fp_cfg.get("mask_mode", "rect")
+    sam_ckpt = fp_cfg.get("sam_checkpoint", "") or os.path.join(
+        fp_dir, "model", "sam_vit_b_01ec64.pth"
+    )
+    meshes = fp_cfg.get("meshes", {})
+    default_mesh = fp_cfg.get("default_mesh", "")
+
+    try:
+        camera.start()
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] 相机启动失败: {e}")
+        sys.exit(1)
+
+    K = camera.intrinsics
+    if K is None:
+        print("[!] 相机无内参，无法运行 FoundationPose")
+        sys.exit(1)
+    K_mat = K_dict_to_matrix(K)
+
+    state = {
+        "mode": "IDLE",        # IDLE | DETECTING | REGISTERING | TRACKING
+        "pending": None,       # {mesh_file, mask, color, depth} 待注册
+        "est": None,           # PoseEstimator
+        "est_mesh": None,      # est 对应的 mesh_file
+        "pose": None,          # 最新 4x4 位姿
+        "status": "IDLE - type command in terminal",
+    }
+    lock = threading.Lock()
+    stop = threading.Event()
+    est_cache = {}            # mesh_file -> PoseEstimator，避免重复加载
+
+    # ZeroMQ 位姿发布：把 6D Pose 发给 foundationpose.launch.py 里的 foundationpose_node
+    publish_zmq = bool(fp_cfg.get("publish_zmq", False))
+    publisher = PosePublisher(fp_cfg.get("zmq_address", "tcp://*:5555")) if publish_zmq else None
+
+    def input_worker():
+        print("\n===== VLM Servo 阶段三 =====")
+        print("在【终端】输入自然语言指令，例如：抓红色的瓶子 / 找到三角形")
+        print("输入 q / quit / exit 退出；显示窗口内按 q 也可退出。\n")
+        while not stop.is_set():
+            try:
+                instruction = input(">> ").strip()
+            except EOFError:
+                break
+            if not instruction:
+                continue
+            if instruction.lower() in ("q", "quit", "exit", "退出"):
+                stop.set()
+                break
+
+            color, depth = camera.latest_pair()
+            if color is None:
+                print("[!] 还没拿到相机画面，请确认 D455 已连接")
+                continue
+
+            with lock:
+                state["mode"] = "DETECTING"
+                state["status"] = "DETECTING..."
+            print(f"[*] 指令: {instruction}  (识别中...)")
+
+            try:
+                result = vlm.detect(color, instruction)
+            except Exception as e:  # noqa: BLE001
+                print(f"[!] VLM 识别失败: {e}")
+                with lock:
+                    state["mode"] = "IDLE"
+                    state["status"] = "ERROR"
+                continue
+
+            dets = result.detections or []
+            if not dets:
+                print("    -> 未找到匹配目标")
+                if DEBUG_DUMP_MISS:
+                    dump_missed_frame(color, depth, instruction)
+                with lock:
+                    state["mode"] = "IDLE"
+                    state["status"] = "NOT FOUND"
+                continue
+
+            det = dets[0]           # 阶段三先处理第一个目标
+            if not det.found:
+                print("    -> 目标无 bbox")
+                with lock:
+                    state["mode"] = "IDLE"
+                    state["status"] = "NO BBOX"
+                continue
+
+            # 目标名 -> 网格文件
+            mesh_file = match_mesh(det.target, meshes, default_mesh, fp_dir)
+            if not mesh_file or not os.path.exists(mesh_file):
+                print(f"[!] 找不到网格: {mesh_file}")
+                print("    请在 config.yaml 的 foundationpose.meshes 里按目标名配置网格")
+                with lock:
+                    state["mode"] = "IDLE"
+                    state["status"] = "NO MESH"
+                continue
+
+            # bbox -> 掩码
+            mask = mask_from_bbox(color, de..bbox, mode=mask_mode,
+                                  sam_checkpoint=sam_ckpt)
+
+            print(f"    -> target = {det.target}, bbox = {list(det.bbox)}")
+            print(f"    -> mesh = {mesh_file}, mask_mode = {mask_mode}")
+
+            # 交给显示线程注册（pending 只消费一次）
+            with lock:
+                state["pending"] = {"mesh_file": mesh_file, "mask": mask,
+                                    "color": color, "depth": depth}
+                state["mode"] = "REGISTERING"
+                state["status"] = "REGISTERING..."
+
+    t = threading.Thread(target=input_worker, name="input", daemon=True)
+    t.start()
+
+    fps = FpsCounter()
+    # AUTOSIZE：窗口紧贴图像尺寸，避免 WINDOW_NORMAL+resizeWindow 在 GTK 下
+    # 窗口大于图像、四周留白边
+    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+
+    print("\n[display] 显示窗口已打开，在终端输入指令。")
+    try:
+        while not stop.is_set():
+            color, depth = camera.latest_pair()
+            if color is None:
+                cv2.waitKey(30)
+                continue
+
+            with lock:
+                mode = state["mode"]
+                est = state["est"]
+                est_mesh = state["est_mesh"]
+                pose = state["pose"]
+                pending = state["pending"]
+                status = state["status"]
+
+            # ---- REGISTERING：在显示线程串行执行注册（pending 只消费一次）----
+            if mode == "REGISTERING" and pending is not None:
+                mesh_file = pending["mesh_file"]
+                try:
+                    if est is None or est_mesh != mesh_file:
+                        print(f"[*] 加载 FoundationPose: {mesh_file}")
+                        est = est_cache.get(mesh_file)
+                        if est is None:
+                            est = PoseEstimator(
+                                mesh_file,
+                                est_refine_iter=int(fp_cfg.get("est_refine_iter", 5)),
+                                track_refine_iter=int(fp_cfg.get("track_refine_iter", 2)),
+                                debug=int(fp_cfg.get("debug", 0)),
+                                debug_dir=fp_cfg.get("debug_dir")
+                                or os.path.join(fp_dir, "debug"),
+                            )
+                            est_cache[mesh_file] = est
+                    with lock:
+                        state["est"] = est
+                        state["est_mesh"] = mesh_file
+                        state["status"] = "REGISTERING..."
+                    pose = est.register(pending["color"], pending["depth"],
+                                        K_mat, pending["mask"])
+                    with lock:
+                        state["pose"] = pose
+                        state["pending"] = None
+                        state["mode"] = "TRACKING"
+                        state["status"] = "TRACKING"
+                    print("    -> 注册成功，进入连续跟踪")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[!] FoundationPose 注册失败: {e}")
+                    with lock:
+                        state["pending"] = None
+                        state["mode"] = "IDLE"
+                        state["status"] = "REGISTER FAILED"
+                continue   # 下一轮抓新帧再跟踪
+
+            # ---- TRACKING：每帧跟踪并叠加 3D 框 ----
+            if mode == "TRACKING" and est is not None:
+                try:
+                    pose = est.track(color, depth, K_mat)
+                    with lock:
+                        state["pose"] = pose
+
+                    color = est.draw(color, pose, K_mat)   # 叠加 3D 框 + 坐标轴
+                    if publisher is not None:
+                        publisher.send(pose, K_mat, est.to_origin, est.bbox3d,
+                                       color.shape[:2])
+                    t_xyz = pose[:3, 3]
+                    status = (f"XYZ=({t_xyz[0]:.3f},"
+                              f"{t_xyz[1]:.3f},{t_xyz[2]:.3f})m")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[!] 跟踪失败: {e}")
+                    with lock:
+                        state["mode"] = "IDLE"
+                        state["status"] = "TRACK FAILED"
+
+            if show_fps:
+                status = f"{status}  {fps.tick():.1f} FPS"
+            draw_hud(color, status=status)
+
+            cv2.imshow(win_name, color)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop.set()
+                break
+    finally:
+        stop.set()
+        cv2.destroyAllWindows()
+        if publisher is not None:
+            publisher.close()
+        camera.stop()
+        print("\n[exit] 已退出。")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[exit] 收到 Ctrl+C，退出。")
+        sys.exit(0)

@@ -1,0 +1,54 @@
+###############################################
+# Modify all parameters related to servoing here
+###############################################
+use_gazebo: false
+
+## Properties of incoming commands
+command_in_type: "speed_units" # 输入命令类型。"speed_units" 表示输入值直接按速度解释，单位是 m/s 和 rad/s。
+scale:
+  linear:  0.1  # 笛卡尔平移最大速度[m/s]。只对末端直线运动指令生效。
+  rotational:  0.3  # 笛卡尔转动最大角速度[rad/s]。只对末端姿态调整指令生效。
+  joint: 0.2  # 关节空间最大速度[rad/s]。只对 joint jog 指令生效。
+
+## Properties of outgoing commands
+publish_period: 0.10  # 实机串口链路先降到 10Hz，避免 Servo 连续小步命令过密。
+command_out_type: std_msgs/Float64MultiArray
+
+# Servo 走速度控制器；初始粗对齐仍由 MoveIt + arm_controller 走轨迹控制。
+command_out_topic: /arm_velocity_controller/commands
+publish_joint_positions: false
+publish_joint_velocities: true
+publish_joint_accelerations: false
+
+## IMPORTANT: Coordinate frames (Must match your TF tree and MoveGroup)
+move_group_name: arm
+planning_frame: base_link
+ee_frame_name: Tool_Link
+robot_link_command_frame: base_link
+
+## IMPORTANT: Topic names
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /joint_states
+status_topic: ~/status
+
+## Smoothing & Safety
+smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"  # 输出速度平滑滤波器，减少抖动和突变。
+incoming_command_timeout:  0.35   # 与 10Hz 控制周期匹配，允许偶发丢帧而不立刻误停。
+num_outgoing_halt_msgs_to_publish: 8  # 触发停机后，额外连续发布多少次“零速度/停止”命令，防止控制器漏收。
+lower_singularity_threshold: 800.0  # 奇异点减速阈值。继续抬高，降低实机测试时的误触发概率。
+hard_stop_singularity_threshold: 1200.0  # 奇异点急停阈值。需大于 lower_singularity_threshold；抬高后更不容易直接急停。
+leaving_singularity_threshold_multiplier: 4.0  # 从奇异区退出时进一步放宽减速限制，减少“刚能动又被拉回去”的现象。
+joint_limit_margin: 0.05  # 距离关节极限的安全余量[rad]；越大越保守，越早因为接近限位而减速。
+
+## Collision checking
+check_collisions: true  # 是否启用碰撞检测。实物测试建议保持开启。
+collision_check_rate: 10.0  # 碰撞检测频率[Hz]。越高越及时，但更吃CPU；10Hz通常够用。
+# collision_check_type: threshold_distance  # 当前仓库中的 MoveIt Servo 源码未读取此参数，已注释。
+self_collision_proximity_threshold: 0.001  # 自碰撞距离阈值[m]；小于该距离开始减速。值越大越保守，越小越容易动起来。
+scene_collision_proximity_threshold: 0.001  # 与环境/障碍物的距离阈值[m]；小于该距离开始减速。应 >= 自碰撞阈值。
+
+# 以下参数在当前仓库中的 MoveIt Servo 源码未读取，保留注释仅作旧配置参考。
+# collision_distance_safety_factor: 5.0  # 旧版/外部工具可能使用；当前版本不起作用。
+# min_allowable_collision_distance: 0.02  # 旧版/外部工具可能使用；当前版本不起作用。
+is_primary_planning_scene_monitor: false

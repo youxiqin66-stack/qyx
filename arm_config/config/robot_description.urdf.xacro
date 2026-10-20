@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robot_description">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+    <xacro:arg name="comm_port"         default="/dev/ttyUSB0" />
+    <xacro:arg name="comm_baudrate"     default="115200" />
+
+    <!-- Import robot_description urdf file -->
+    <xacro:include filename="$(find robot_description)/urdf/robot_description.urdf" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="robot_description.ros2_control.xacro" />
+
+
+    <xacro:robot_description_ros2_control
+        name="ArmSystem"
+        initial_positions_file="$(arg initial_positions_file)"
+        comm_port="$(arg comm_port)"
+        comm_baudrate="$(arg comm_baudrate)"/>
+
+</robot>

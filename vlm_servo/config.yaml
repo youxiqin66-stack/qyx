@@ -1,0 +1,70 @@
+# =============================================================
+# VLM Servo 阶段一 + 阶段二 + 阶段三 配置
+# 阶段一：自然语言 -> Qwen3-VL(API) -> bbox -> OpenCV 画框
+# 阶段二：bbox + D455 对齐深度 + 内参 -> 相机系 3D XYZ
+# 阶段三：bbox -> 掩码 -> FoundationPose -> 6D Pose（相机系）
+# =============================================================
+
+camera:
+  # 相机源：realsense = pyrealsense2 直取 D455；image = 静态图 + 合成深度（离线测试）
+  type: realsense
+  # 与你 camera_module.py 保持一致用 640x480（D455 对齐更稳、帧内存更小）
+  width: 640
+  height: 480
+  fps: 30
+  image_path: "test_image.jpg"
+  mock_depth_meters: 0.6
+  # intrinsics: {fx: 640.0, fy: 640.0, cx: 640.0, cy: 360.0}
+
+vlm:
+  # qwen = 阿里云百炼 DashScope Qwen3-VL(API，不占显存)；mock = 固定 bbox 离线测试
+  type: qwen
+  api_key_env: "DASHSCOPE_API_KEY"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "qwen3-vl-plus"
+  timeout: 60
+  # 送模型前的图像尺度：长边大于 max 则缩小，小于 min 则放大。
+  # min 很重要：640x480 直接送进去时小目标（如 45px 高的三角块）分不到
+  # 足够的 patch，模型会返回空 objects。放到 1280 后同一帧就能认出来。
+  max_image_size: 1280
+  min_image_size: 1280
+  extra_body: {}
+  mock_bboxes: [[300, 200, 360, 620]]
+
+depth:
+  # bbox -> XYZ 的深度有效范围（米）与中心区域比例
+  min_depth: 0.1
+  max_depth: 3.0
+  center_ratio: 0.5
+
+foundationpose:
+  fp_dir: "/home/qyx/LLM/code/FoundationPose"
+  est_refine_iter: 5        # 首帧注册迭代次数（越大越准越慢）
+  track_refine_iter: 2      # 跟踪迭代次数
+  debug: 0                  # 0=不调试；>=1 输出中间图到 debug_dir
+  debug_dir: ""             # 空 = fp_dir/debug
+  # 掩码模式：rect = bbox 矩形（快、零额外显存）；sam = segment_anything 精细掩码（准、占显存）
+  mask_mode: rect
+  sam_checkpoint: ""        # sam 模式用；空 = fp_dir/model/sam_vit_b_01ec64.pth
+  # 目标名关键词 -> 网格文件（相对 fp_dir）。VLM 目标名是英文，按子串匹配
+  meshes:
+    "bottle": "demo_prb_data/test1/mesh/bottle_red.obj"
+    "瓶子": "demo_prb_data/test1/mesh/bottle_red.obj"
+    "red bottle": "demo_prb_data/test1/mesh/bottle_red.obj"
+    "triangle": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
+    "triangular": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
+    "triangular block": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
+    "三角": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
+    "三角块": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
+  # 匹配不到关键词时用的默认网格
+  default_mesh: "demo_prb_data/test1/mesh/bottle_red.obj"
+  # 是否通过 ZeroMQ 把 6D Pose 发给 foundationpose.launch.py 里的 foundationpose_node
+  publish_zmq: true
+  zmq_address: "tcp://*:5555"
+
+display:
+  window_name: "VLM Servo - Phase 3 (RealSense D455)"
+  font_scale: 0.7
+  line_thickness: 2
+  box_color: [0, 255, 0]
+  show_fps: true
