@@ -8,6 +8,7 @@
 import time
 
 from .base import BaseVLM, Detection, VisionResult
+from .instruction import normalize_instruction
 
 
 class MockVLM(BaseVLM):
@@ -19,13 +20,17 @@ class MockVLM(BaseVLM):
         # 模拟网络/推理延迟，让流程行为更接近真实调用
         time.sleep(0.5)
 
-        # 简单规则抠出"目标名"（仅用于演示流程，不代表真实理解能力）
-        target = instruction
-        for ch in ("抓取", "拿取", "取出", "靠近", "接近", "挨进", "贴近", "打磨",
-                   "加工", "磨削", "精磨", "抓", "拿", "取", "递", "找", "跟",
-                   "磨", "挨"):
-            target = target.replace(ch, "")
-        target = target.strip() or "object"
+        instruction, forced_target = normalize_instruction(instruction)
+        if forced_target:
+            target = forced_target
+        else:
+            # 简单规则抠出"目标名"（仅用于演示流程，不代表真实理解能力）
+            target = instruction
+            for ch in ("抓取", "拿取", "取出", "靠近", "接近", "挨进", "贴近", "打磨",
+                       "加工", "磨削", "精磨", "抓", "拿", "取", "递", "找", "跟",
+                       "磨", "挨"):
+                target = target.replace(ch, "")
+            target = target.strip() or "object"
 
         dets = []
         for i, bb in enumerate(self.bboxes):

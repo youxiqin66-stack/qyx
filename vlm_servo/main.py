@@ -24,7 +24,7 @@ from config import load_config
 from camera import build_camera
 from depth3d import bbox_to_xyz
 from visualizer import draw_detections, draw_hud, FpsCounter
-from vlm import build_vlm
+from vlm import build_vlm, normalize_instruction
 
 
 def _fmt_xyz(xyz):
@@ -88,6 +88,13 @@ def main():
                 stop_event.set()
                 break
 
+            # 孔加工类说法统一改写为红瓶目标（与 main_pose.py 一致）
+            raw_instruction = instruction
+            instruction, forced_target = normalize_instruction(instruction)
+            if forced_target:
+                print(f"    [intent] 「{raw_instruction}」-> 红瓶"
+                      f"（target={forced_target}）")
+
             # 取同一帧的彩色 + 对齐深度，保证 bbox 与深度像素对齐
             color, depth = camera.latest_pair()
             if color is None:
@@ -107,6 +114,9 @@ def main():
                 continue
 
             dets = result.detections or []
+            if forced_target:
+                for det in dets:
+                    det.target = forced_target
 
             # 阶段二：对每个 bbox 反投影相机系 XYZ
             xyz_list = []

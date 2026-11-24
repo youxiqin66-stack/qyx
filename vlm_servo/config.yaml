@@ -48,16 +48,18 @@ foundationpose:
   sam_checkpoint: ""        # sam 模式用；空 = fp_dir/model/sam_vit_b_01ec64.pth
   # 目标名关键词 -> 网格文件（相对 fp_dir）。VLM 目标名是英文，按子串匹配
   meshes:
-    "bottle": "demo_prb_data/test1/mesh/bottle_red.obj"
-    "瓶子": "demo_prb_data/test1/mesh/bottle_red.obj"
-    "red bottle": "demo_prb_data/test1/mesh/bottle_red.obj"
+    "bottle": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
+    "瓶子": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
+    "红瓶": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
+    "红色瓶子": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
+    "red bottle": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
     "triangle": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
     "triangular": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
     "triangular block": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
     "三角": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
     "三角块": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
   # 匹配不到关键词时用的默认网格
-  default_mesh: "demo_prb_data/test1/mesh/bottle_red.obj"
+  default_mesh: "demo_prb_data/test1/mesh/bottle_red_centered.obj"
   # 是否通过 ZeroMQ 把 6D Pose 发给 foundationpose.launch.py 里的 foundationpose_node
   publish_zmq: true
   zmq_address: "tcp://*:5555"

@@ -26,7 +26,7 @@ import cv2
 from config import load_config
 from camera import build_camera
 from visualizer import draw_hud, FpsCounter
-from vlm import build_vlm
+from vlm import build_vlm, normalize_instruction
 from mask_gen import mask_from_bbox
 from foundationpose_bridge import PoseEstimator, K_dict_to_matrix, match_mesh
 from pose_pub import PosePublisher
@@ -120,6 +120,14 @@ def main():
                 stop.set()
                 break
 
+            # 孔加工类说法（打磨孔/钻孔/加工孔/瓶口…）统一改写成红瓶目标，
+            # 否则 VLM 会去找「孔」的像素区域，FoundationPose 注册会失败或漂移。
+            raw_instruction = instruction
+            instruction, forced_target = normalize_instruction(instruction)
+            if forced_target:
+                print(f"    [intent] 「{raw_instruction}」-> 跟随红瓶"
+                      f"（target={forced_target}）")
+
             color, depth = camera.latest_pair()
             if color is None:
                 print("[!] 还没拿到相机画面，请确认 D455 已连接")
@@ -150,6 +158,9 @@ def main():
                 continue
 
             det = dets[0]           # 阶段三先处理第一个目标
+            if forced_target:
+                # 目标名固定为 red bottle，保证 mesh 匹配到 bottle_red_centered.obj
+                det.target = forced_target
             if not det.found:
                 print("    -> 目标无 bbox")
                 with lock:
@@ -168,7 +179,7 @@ def main():
                 continue
 
             # bbox -> 掩码
-            mask = mask_from_bbox(color, de..bbox, mode=mask_mode,
+            mask = mask_from_bbox(color, det.bbox, mode=mask_mode,
                                   sam_checkpoint=sam_ckpt)
 
             print(f"    -> target = {det.target}, bbox = {list(det.bbox)}")

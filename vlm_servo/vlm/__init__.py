@@ -7,10 +7,12 @@
 import os
 
 from .base import BaseVLM, Detection, VisionResult
+from .instruction import normalize_instruction
 from .mock_vlm import MockVLM
 from .qwen_vl import QwenVLM
 
-__all__ = ["BaseVLM", "Detection", "VisionResult", "build_vlm"]
+__all__ = ["BaseVLM", "Detection", "VisionResult", "build_vlm",
+           "normalize_instruction"]
 
 
 def build_vlm(cfg) -> BaseVLM:

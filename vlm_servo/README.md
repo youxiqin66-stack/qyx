@@ -120,11 +120,11 @@ FoundationPose 是**基于模型**的：每个物体需要一个网格（.obj）
 ```yaml
 foundationpose:
   meshes:
-    "bottle": "demo_prb_data/test1/mesh/bottle_red.obj"
-    "瓶子":  "demo_prb_data/test1/mesh/bottle_red.obj"
+    "bottle": "demo_prb_data/test1/mesh/bottle_red_centered.obj"
+    "瓶子":  "demo_prb_data/test1/mesh/bottle_red_centered.obj"
     "triangle": "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
     "三角":  "demo_prb_data/test_redtriangle/mesh/red_triangle.obj"
-  default_mesh: "demo_prb_data/test1/mesh/bottle_red.obj"
+  default_mesh: "demo_prb_data/test1/mesh/bottle_red_centered.obj"
 ```
 
 > 这是模型位姿估计的固有属性：想抓某个新物体，需要先有它的 mesh（或后续用重建方式生成）。VLM 解决“识别什么”，mesh 解决“怎么摆”。
@@ -187,6 +187,52 @@ Python 视觉侧的意图分类和动作路由**已整体移除**，现在只输
 - 原设计里**确认前** Python 侧只发 `intent="unknown"`，确认后才发真实 intent；意图移除后这条链路要重新设计。
 - **执行确认链路**（原设计）：`main_pose.py` → ZeroMQ `{"command":"execute"}` → `foundationpose_node.py` → `/action_dispatcher/execute`（std_srvs/Trigger）。
 - **视觉伺服多一步**（原设计）：`doGrind` 先离散规划「初始位姿对齐」到 `T_BASE_OBJ * T_OBJ_TCP`，`/execute` 执行对齐到位后自动切速度控制器 + 启动连续伺服。
+
+### 8.8 红瓶跟随实验（当前）
+
+**语言侧**：`vlm/instruction.py` 把孔加工类说法确定性映射到红瓶，不再依赖模型理解「孔」是什么：
+
+| 输入 | 送给 VLM 的指令 | 强制目标 |
+|------|----------------|----------|
+| 打磨孔 / 钻孔 / 加工孔 / 磨孔 / 铰孔 / 镗孔 / 攻丝 / 瓶口 … | 找到画面中的红色瓶子 | `red bottle` |
+
+未命中的指令原样透传（例如「找到三角形」「打磨三角块」仍按原逻辑走）。
+
+**伺服侧**（`hello_moveit/visual_servo.cpp`）：目标点取瓶口中心
+（模型原点已在瓶轴上，建模系 `(0,0,130)mm`）沿**瓶口法线**抬高 `follow_standoff`，
+**Tool_Link 原点 = 瓶口 + 法线 × follow_standoff**（默认 2cm），**+X 指向瓶子 -Z**。
+杆 STL 沿 Tool_Link -X，所以 +X 朝 -Z 时杆朝 +法线方向伸出（杆尖在原点上方 8cm）。
+`+X 朝 -Z` 位形下 Tool_Link 原点的经验可达范围约为 x ∈ [-0.26, 0.45]、z ∈ [-0.22, 0.27]（base_link）。
+控制律：P 控制（`kp_pos=1.0`, `kp_rot=0.6`），限速 `0.15 m/s / 0.35 rad/s`，
+误差带 `4mm / 0.08rad`，Kalman 位置估计 + 速度前馈（与三角块版一致）。
+参数（`ros2 run hello_moveit visual_servo --ros-args -p ...`）：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `target_mode` | `bottle` | `bottle`=红瓶跟随；`triangle`=原三角块抓取偏置 |
+| `vertical_mode` | `bottle` | `bottle`=沿瓶口法线（瓶子斜放也用这个）；`world`=固定世界竖直（只适合瓶子正放） |
+| `follow_standoff` | `0.020` | 杆尖距瓶口高度 [m] |
+
+**对齐 → 跟随（当前流程）**：`visual_servo` 本身不做离散对齐，起节点 1 秒后就切速度
+控制器开始连续伺服，所以要先离散对齐到瓶口上方再跟随：
+
+```bash
+ros2 run hello_moveit hello_moveit    # 对齐：规划到瓶口上方，RvizVisualToolsGui 两次 Next
+ros2 run hello_moveit visual_servo    # 跟随：目标位姿与上一步完全一致，切换后误差≈0
+```
+
+- `hello_moveit` 的参数与 `visual_servo` 同名同义（`target_mode` / `vertical_mode` /
+  `follow_standoff`），默认都是红瓶；对齐完直接就位，不会被伺服拽着跳。
+- 三角块对齐的逻辑原样保留为 **`hello_moveit1`**（`ros2 run hello_moveit hello_moveit1`）；
+  也可以 `ros2 run hello_moveit hello_moveit -p target_mode:=triangle`，两者等价。
+- 对齐是离散规划，必须用 `arm_controller`；节点启动时会自动切回来（`visual_servo`
+  之后再自动切到速度控制器）。
+- **姿态只锁轴向、不锁 roll**：`hello_moveit` 和 `visual_servo` 都只把 `Tool_Link`
+  的 +X 轴对准**瓶子的 -Z**（沿瓶口法线反方向插入；注意不是 +Z），绕杆轴的 roll
+  取离当前姿态最近的解（`FromTwoVectors`）。杆是回转体，roll 无意义；
+  固定 roll 会因关节限位（尤其 joint5 ±90°）导致 IK/规划直接失败。
+- 对齐和跟随必须用**同一个轴向**：servo 里 roll-free 取的是名义姿态的 X 轴
+  （`T_BASE_TCP_des` 的 col(0)），不是物体的 +Z，否则两者差 180°。
 
 ## 9. 依赖
 
