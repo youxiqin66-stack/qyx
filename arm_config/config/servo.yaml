@@ -11,7 +11,7 @@ scale:
   joint: 0.2  # 关节空间最大速度[rad/s]。只对 joint jog 指令生效。
 
 ## Properties of outgoing commands
-publish_period: 0.10  # 实机串口链路先降到 10Hz，避免 Servo 连续小步命令过密。
+publish_period: 0.10  # 10Hz。与 visual_servo 的 100ms 控制周期匹配；控制器以 15Hz 采样，不会导致串口命令堆积。
 command_out_type: std_msgs/Float64MultiArray
 
 # Servo 走速度控制器；初始粗对齐仍由 MoveIt + arm_controller 走轨迹控制。
@@ -34,7 +34,7 @@ status_topic: ~/status
 
 ## Smoothing & Safety
 smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"  # 输出速度平滑滤波器，减少抖动和突变。
-incoming_command_timeout:  0.35   # 与 10Hz 控制周期匹配，允许偶发丢帧而不立刻误停。
+incoming_command_timeout:  0.35   # 与 10Hz 控制周期匹配（0.35s ≈ 3.5 个周期），允许偶发丢帧而不立刻误停。
 num_outgoing_halt_msgs_to_publish: 8  # 触发停机后，额外连续发布多少次“零速度/停止”命令，防止控制器漏收。
 lower_singularity_threshold: 800.0  # 奇异点减速阈值。继续抬高，降低实机测试时的误触发概率。
 hard_stop_singularity_threshold: 1200.0  # 奇异点急停阈值。需大于 lower_singularity_threshold；抬高后更不容易直接急停。
@@ -42,7 +42,7 @@ leaving_singularity_threshold_multiplier: 4.0  # 从奇异区退出时进一步�
 joint_limit_margin: 0.05  # 距离关节极限的安全余量[rad]；越大越保守，越早因为接近限位而减速。
 
 ## Collision checking
-check_collisions: true  # 是否启用碰撞检测。实物测试建议保持开启。
+check_collisions: false  # 临时关闭碰撞检测：打磨任务工具需贴工件，验证 status 4 频繁急停是否为误报。
 collision_check_rate: 10.0  # 碰撞检测频率[Hz]。越高越及时，但更吃CPU；10Hz通常够用。
 # collision_check_type: threshold_distance  # 当前仓库中的 MoveIt Servo 源码未读取此参数，已注释。
 self_collision_proximity_threshold: 0.001  # 自碰撞距离阈值[m]；小于该距离开始减速。值越大越保守，越小越容易动起来。

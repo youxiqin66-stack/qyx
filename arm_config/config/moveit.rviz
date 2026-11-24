@@ -52,6 +52,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /rviz_visual_tools
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Tracked Object
+      Namespaces:
+        tracked_object: true
+      Queue Size: 100
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /object_marker
+      Value: true
     - Acceleration_Scaling_Factor: 0.15
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true

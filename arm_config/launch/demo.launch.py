@@ -111,7 +111,7 @@ def generate_launch_description():
     mesh_file_arg = DeclareLaunchArgument(
         'mesh_file',
         default_value='/home/qyx/LLM/code/ws_moveit/src/hello_moveit/red_triangle.STL',
-        description='Path to the STL mesh file'
+        description='Path to the STL mesh file (三角块默认；红瓶用 bottle_red_centered.STL)'
     )
     
     object_visualizer_node = Node(
@@ -126,23 +126,7 @@ def generate_launch_description():
             'mesh_scale': 0.001,  # 将毫米单位转换为米单位 (mm -> m)
         }]
     )
-
-    # FoundationPose ROS2 节点：ZeroMQ 订阅 -> /object_pose + /object_intent + TF
-    foundationpose_node = Node(
-        package='foundationpose_ros2',
-        executable='foundationpose_node',
-        name='foundationpose_node',
-        output='screen',
-    )
-
-    # 统一动作调度节点：按 intent 执行 approach/grasp/grind
-    action_dispatcher_node = Node(
-        package='hello_moveit',
-        executable='action_dispatcher',
-        name='action_dispatcher',
-        output='screen',
-    )
-
+    
     # 获取 demo launch 的内容
     demo_launch = generate_demo_launch(moveit_config)
     
@@ -153,9 +137,7 @@ def generate_launch_description():
     ld.add_action(mesh_file_arg)
     ld.add_action(static_tf_node)
     ld.add_action(object_visualizer_node)
-    ld.add_action(foundationpose_node)
-    ld.add_action(action_dispatcher_node)
-
+    
     # 添加 demo launch 中的所有节点
     for entity in demo_launch.entities:
         ld.add_action(entity)

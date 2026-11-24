@@ -1,8 +1,8 @@
 # This config file is used by ros2_control
 controller_manager:
   ros__parameters:
-    # 实机串口硬件接口较慢，先把 ros2_control 主循环降到 15Hz，
-    # 与 servo.yaml 中 publish_period=0.10 基本对齐，避免新命令堆积。
+    # ros2_control 主循环 15Hz，与 servo.yaml publish_period=0.10（10Hz）、visual_servo 100ms（10Hz）对齐。
+    # read+write 单周期估算 ~25~35ms < 66.7ms；若实测出现超周期/丢命令警告，退回 10Hz。
     update_rate: 15  # Hz
 
     arm_controller:
