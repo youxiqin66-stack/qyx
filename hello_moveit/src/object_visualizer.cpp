@@ -19,6 +19,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>                         // PoseStamped 消息类型
 #include <moveit/planning_scene_interface/planning_scene_interface.h> // MoveIt 场景接口
 #include <moveit_msgs/msg/collision_object.hpp>                       // 碰撞物体消息定义
+#include <visualization_msgs/msg/marker.hpp>                          // RViz Marker（纯显示，不进碰撞场景）
 #include <shape_msgs/msg/mesh.hpp>                                    // Mesh 消息类型
 #include <geometric_shapes/shape_operations.h>                        // 形状操作工具（加载 mesh）
 #include <geometric_shapes/mesh_operations.h>                         // Mesh 操作工具
@@ -71,11 +72,17 @@ public:
     // 例如 0.001 可将毫米单位的模型转换为米单位
     this->declare_parameter<double>("mesh_scale", 0.001);
 
+    // as_collision_object: 是否把物体作为碰撞体加进 MoveIt 规划场景。
+    // 默认 true：与三角块的处理完全一致——物体进 PlanningScene，RViz 看得到，
+    // 也参与碰撞检测/规划。设为 false 时退化成纯 Marker 显示。
+    this->declare_parameter<bool>("as_collision_object", true);
+
     // ==================== 读取参数值 ====================
     mesh_file_ = this->get_parameter("mesh_file").as_string();
     object_id_ = this->get_parameter("object_id").as_string();
     planning_frame_ = this->get_parameter("planning_frame").as_string();
     mesh_scale_ = this->get_parameter("mesh_scale").as_double();
+    as_collision_object_ = this->get_parameter("as_collision_object").as_bool();
 
     // ==================== 初始化 TF2 组件 ====================
     // TF Buffer: 存储最近几秒内的所有坐标变换信息
@@ -90,6 +97,16 @@ public:
     // PlanningSceneInterface: MoveIt 提供的场景管理接口
     // 用于添加、更新、删除碰撞物体
     planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
+
+    if (!as_collision_object_)
+    {
+      // 跟随任务不需要瓶子当碰撞体：顺便清掉之前残留在场景里的物体
+      // （id "tracked_object" 是本节点以前的 id，旧版 bottle 节点还用过 "bottle"）。
+      planning_scene_interface_->removeCollisionObjects({ object_id_, "bottle" });
+    }
+
+    // 纯显示用的 Marker（MESH_RESOURCE），不参与碰撞检测
+    marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/object_marker", 10);
 
     // ==================== 创建订阅器 ====================
     // 订阅 /object_pose 话题（类型：geometry_msgs::msg::PoseStamped）
@@ -271,9 +288,17 @@ private:
       return;
     }
 
-    // ==================== 更新 MoveIt 场景 ====================
-    // 将转换后的位姿应用到 MoveIt 的碰撞检测场景中
-    updateObject(transformed_pose);
+    // ==================== 显示 / 更新场景 ====================
+    // 与三角块一致：默认把物体作为碰撞体加进 MoveIt 规划场景
+    // （RViz 的 PlanningScene 显示实时刷新）；只有显式关掉时才用纯 Marker。
+    if (as_collision_object_)
+    {
+      updateObject(transformed_pose);
+    }
+    else
+    {
+      publishMarker(transformed_pose);
+    }
 
     // ==================== 定期打印调试信息 ====================
     // 使用静态计数器实现简单的日志节流
@@ -288,6 +313,34 @@ private:
                   transformed_pose.pose.position.y,
                   transformed_pose.pose.position.z);
     }
+  }
+
+  /**
+   * @brief 发布纯显示用的 Marker（MESH_RESOURCE），不进 MoveIt 碰撞场景
+   *
+   * RViz 里添加 Marker 显示（topic /object_marker）即可实时看到物体位置。
+   */
+  void publishMarker(const geometry_msgs::msg::PoseStamped &pose)
+  {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = planning_frame_;
+    marker.header.stamp = this->now();
+    marker.ns = object_id_;
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::MESH_RESOURCE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose = pose.pose;
+    marker.scale.x = mesh_scale_;
+    marker.scale.y = mesh_scale_;
+    marker.scale.z = mesh_scale_;
+    marker.color.r = 0.2f;
+    marker.color.g = 0.9f;
+    marker.color.b = 0.2f;
+    marker.color.a = 0.85f;
+    marker.mesh_resource = "file://" + mesh_file_;
+    marker.mesh_use_embedded_materials = false;
+    marker.lifetime = rclcpp::Duration::from_seconds(0.5);  // 位姿流停了就自动消失
+    marker_pub_->publish(marker);
   }
 
   /**
@@ -363,6 +416,12 @@ private:
 
   // MoveIt 场景接口：用于添加、更新、删除场景中的碰撞物体
   std::shared_ptr<moveit::planning_interface::PlanningSceneInterface> planning_scene_interface_;
+
+  // 纯显示用的 Marker 发布器（/object_marker）
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
+
+  // 是否把物体当碰撞体加入规划场景（默认 false，只显示）
+  bool as_collision_object_{ false };
 
   // TF2 Buffer：存储最近的坐标变换信息（默认缓存约 10 秒）
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

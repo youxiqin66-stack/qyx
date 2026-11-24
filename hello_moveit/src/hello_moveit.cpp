@@ -1,6 +1,10 @@
 #include <memory>
 #include <future>
 #include <thread>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <unordered_map>
 
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
@@ -15,24 +19,37 @@
 
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit/robot_model/joint_model_group.h>
+#include <moveit_msgs/srv/get_position_ik.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
 #include <moveit_visual_tools/moveit_visual_tools.h>
 
+#include "hello_moveit/bottle_offsets.h"
+
 /**
- * @brief 订阅 /object_pose，根据 T_OBJ_TCP 偏置计算 TCP 目标位姿，然后规划并执行
+ * @brief 【对齐节点】订阅一次 /object_pose，算出 TCP 目标位姿，规划并执行。
  *
- * 数学关系：
- *   T_BASE_TCP = T_BASE_OBJ × T_OBJ_TCP
+ * 有两个 target_mode，和目标模型对应：
+ *   - bottle（默认，红瓶跟随用）：目标 = 瓶口中心沿瓶口法线抬高
+ *       follow_standoff，**Tool_Link 原点就在该点**，**+X 指向瓶子的 -Z**
+ *       （瓶子斜放时法线一起倾斜）。
+ *     这个位姿与 visual_servo 里 target_mode=bottle 算出的位姿完全一致，
+ *     所以对齐完成后直接起 visual_servo，误差≈0，不会被伺服拽着跳。
+ *   - triangle（原三角块）：T_BASE_TCP = T_BASE_OBJ × T_OBJ_TCP，
+ *     与 hello_moveit1 完全等价，保留在这里方便用同一入口切换。
  *
- * T_OBJ_TCP（TCP 相对于物体坐标系的齐次变换矩阵，单位：米）：
- *   R = [ 0.7071   0  -0.7071 ]    t = [-0.0072 ]
- *       [-0.7071   0  -0.7071 ]        [ 0.04958]
- *       [ 0        1   0      ]        [ 0.01725]
+ * 用法：
+ *   ros2 run hello_moveit hello_moveit                    # 红瓶，沿瓶口法线（默认）
+ *   ros2 run hello_moveit hello_moveit -p vertical_mode:=world   # 瓶子正放时用世界竖直
+ *   ros2 run hello_moveit hello_moveit -p target_mode:=triangle
+ *   ros2 run hello_moveit hello_moveit1                   # 原三角块节点
  */
 
 // ============================================================
-// 全局：T_OBJ_TCP 偏置矩阵（固定不变）
+// 三角块偏置（原 hello_moveit 的 T_OBJ_TCP，原样保留）
 // ============================================================
-Eigen::Isometry3d buildTcpOffset()
+Eigen::Isometry3d buildTcpOffsetTriangle()
 {
   // 旋转矩阵部分（列主序赋值）
   Eigen::Matrix3d R;
@@ -50,7 +67,7 @@ Eigen::Isometry3d buildTcpOffset()
 }
 
 // ============================================================
-// 主函数
+// 控制器辅助函数
 // ============================================================
 namespace
 {
@@ -174,11 +191,36 @@ int main(int argc, char* argv[])
 
   auto const logger = rclcpp::get_logger("hello_moveit");
 
+  // 与 visual_servo 保持同名同义的参数：对齐完直接起伺服，目标位姿一致。
+  // 注意：NodeOptions 开了 automatically_declare_parameters_from_overrides，
+  // 命令行 -p 传进来的参数在构造时就已声明，这里不能再 declare_parameter
+  // （会抛 ParameterAlreadyDeclaredException），所以用 has_parameter 判断。
+  auto get_string_param = [&node](const std::string& name, const std::string& def) {
+    return node->has_parameter(name) ? node->get_parameter(name).as_string() : def;
+  };
+  auto get_double_param = [&node](const std::string& name, double def) {
+    return node->has_parameter(name) ? node->get_parameter(name).as_double() : def;
+  };
+
+  const std::string target_mode = get_string_param("target_mode", "bottle");
+  // 默认跟随瓶子自身轴向：瓶子斜放时，Tool_Link +X 要朝瓶子 -Z 插入，
+  // 而不是世界竖直（vertical_mode=world 只适合瓶子正放的情况）。
+  const std::string vertical_mode = get_string_param("vertical_mode", "bottle");
+  const double follow_standoff = get_double_param("follow_standoff", 0.020);
+  // roll_mode=free（默认）：只锁杆轴向，绕杆轴的 roll 取离当前最近的解；
+  // roll_mode=fixed：用完整 R_rod，roll 也定死（joint5 限位时可能 IK 无解）。
+  const std::string roll_mode = get_string_param("roll_mode", "free");
+
+  RCLCPP_INFO(logger, "target_mode=%s vertical_mode=%s follow_standoff=%.0fmm roll_mode=%s",
+              target_mode.c_str(), vertical_mode.c_str(),
+              follow_standoff * 1000.0, roll_mode.c_str());
+
   // 使用多线程执行器：同时处理 MoveIt 回调和话题订阅
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
   auto spinner = std::thread([&executor]() { executor.spin(); });
 
+  // 对齐是离散规划，必须用轨迹控制器
   if (!switchControllers(node, { "arm_controller" }, { "arm_velocity_controller" })) {
     rclcpp::shutdown();
     spinner.join();
@@ -190,10 +232,20 @@ int main(int argc, char* argv[])
   // ============================================================
   using moveit::planning_interface::MoveGroupInterface;
   auto move_group = MoveGroupInterface(node, "arm");
-  move_group.setPlanningTime(50);              // 增加规划超时时间到 30 秒
-  move_group.setNumPlanningAttempts(30);           // 增加重试次数到 30 次，大幅提高随机采样规划器的成功率
-  move_group.setGoalPositionTolerance(0.005);    // 放宽位置容差：10 mm (1 cm)
-  move_group.setGoalOrientationTolerance(0.2);   // 放宽姿态容差：约 28°
+
+  // 规划时长参数化。原来 50s × 30 次会把 CPU 打满、RViz 看起来像卡死，
+  // 失败也要等很久才返回。默认改成 5s × 10 次，失败能快速反馈。
+  const double planning_time = get_double_param("planning_time", 5.0);
+  const int planning_attempts =
+      node->has_parameter("planning_attempts")
+          ? static_cast<int>(node->get_parameter("planning_attempts").as_int())
+          : 5;
+  move_group.setPlanningTime(planning_time);
+  move_group.setNumPlanningAttempts(planning_attempts);
+  move_group.setGoalPositionTolerance(0.005);   // 5 mm
+  move_group.setGoalOrientationTolerance(0.2);  // 约 11.5°
+  RCLCPP_INFO(logger, "planning_time=%.1fs attempts=%d",
+              planning_time, planning_attempts);
 
   // 可视化工具
   auto visual_tools = moveit_visual_tools::MoveItVisualTools{
@@ -218,15 +270,29 @@ int main(int argc, char* argv[])
   };
 
   // ============================================================
-  // TF2 - 用于将 /object_pose 变换到 base_link 坐标系
+  // 杆是回转体：只约束 Tool_Link 的 X 轴对准名义 X（瓶子 -Z），绕杆轴的 roll
+  // 取离当前姿态最近的解。固定 roll 会因关节限位导致 IK/规划直接失败。
+  // ============================================================
+  auto const align_roll_to_current = [&move_group](const Eigen::Isometry3d& nominal) {
+    const auto cur = move_group.getCurrentPose("Tool_Link");
+    Eigen::Isometry3d T_cur;
+    tf2::fromMsg(cur.pose, T_cur);
+
+    const Eigen::Vector3d x_tgt = nominal.linear().col(0);  // 目标 X = 瓶口轴线
+    const Eigen::Vector3d x_cur = T_cur.linear().col(0);    // 当前杆 X 方向
+    const Eigen::Quaterniond q = Eigen::Quaterniond::FromTwoVectors(x_cur, x_tgt);
+
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.linear() = q * T_cur.linear();   // X 对准目标，Y/Z（roll）离当前最近
+    T.translation() = nominal.translation();
+    return T;
+  };
+
+  // ============================================================
+  // TF2 - 用于将 /object_pose 变换到规划坐标系
   // ============================================================
   auto tf_buffer   = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
-
-  // ============================================================
-  // 固定的 T_OBJ_TCP 偏置
-  // ============================================================
-  const Eigen::Isometry3d T_OBJ_TCP = buildTcpOffset();
 
   // ============================================================
   // 订阅 /object_pose，接收一次后进行规划执行
@@ -235,7 +301,6 @@ int main(int argc, char* argv[])
   draw_title("Waiting for object pose");
   visual_tools.trigger();
 
-  // 使用 promise/future 接收第一条消息
   std::promise<geometry_msgs::msg::PoseStamped> pose_promise;
   auto pose_future = pose_promise.get_future();
   bool received = false;
@@ -262,13 +327,12 @@ int main(int argc, char* argv[])
               object_pose_msg.header.frame_id.c_str());
 
   // ============================================================
-  // 将物体位姿变换到 base_link 坐标系
+  // 将物体位姿变换到规划坐标系
   // ============================================================
-  const std::string planning_frame = move_group.getPlanningFrame();  // 通常是 base_footprint 或 base_link 
+  const std::string planning_frame = move_group.getPlanningFrame();
 
   geometry_msgs::msg::PoseStamped object_pose_base;
   try {
-    // 等待 TF 可用（最多等 1 秒）
     if (!tf_buffer->canTransform(planning_frame,
                                   object_pose_msg.header.frame_id,
                                   object_pose_msg.header.stamp,
@@ -293,17 +357,148 @@ int main(int argc, char* argv[])
   }
 
   // ============================================================
-  // 计算 TCP 目标位姿：T_BASE_TCP = T_BASE_OBJ × T_OBJ_TCP
+  // 计算 TCP 目标位姿
   // ============================================================
-
-  // 将 ROS Pose 消息转换为 Eigen::Isometry3d
   Eigen::Isometry3d T_BASE_OBJ;
   tf2::fromMsg(object_pose_base.pose, T_BASE_OBJ);
 
-  // 核心计算
-  const Eigen::Isometry3d T_BASE_TCP = T_BASE_OBJ * T_OBJ_TCP;
+  Eigen::Isometry3d T_BASE_TCP = Eigen::Isometry3d::Identity();
+  if (target_mode == "bottle") {
+    // 与 visual_servo.cpp 中 target_mode=bottle 的算法逐行一致：
+    //   瓶口中心 p_mouth = T_BASE_OBJ * (kOpeningX, kOpeningY, kRimZ)
+    //   Tool_Link 原点 = p_mouth + axis*follow_standoff
+    //   axis = 世界 +Z（vertical_mode=world）或瓶子自身 +Z（vertical_mode=bottle）
+    //   姿态 = Tool_Link +X 指向瓶子 -Z（= -axis；bottle 模式下随瓶子倾斜）
+    const Eigen::Vector3d p_mouth = T_BASE_OBJ * Eigen::Vector3d(
+        bottle_offset::kOpeningX, bottle_offset::kOpeningY, bottle_offset::kRimZ);
 
-  // 将结果转换回 ROS Pose 消息
+    const bool follow_bottle_axis = (vertical_mode == "bottle");
+    const Eigen::Vector3d axis = follow_bottle_axis
+        ? Eigen::Vector3d(T_BASE_OBJ.linear().col(2))
+        : Eigen::Vector3d::UnitZ();
+
+    // Tool_Link 原点 = 瓶口沿法线方向 standoff 处（默认 2cm）。
+    const Eigen::Matrix3d R_rod = bottle_offset::buildRodVerticalDown().linear();
+    const Eigen::Matrix3d R_nominal = follow_bottle_axis
+        ? Eigen::Matrix3d(T_BASE_OBJ.linear() * R_rod)
+        : R_rod;
+    T_BASE_TCP.linear() = R_nominal;
+    T_BASE_TCP.translation() = p_mouth + axis * follow_standoff;
+
+    // roll_mode=free：只锁杆的轴向（X 对准 axis），roll 取离当前最近。
+    // roll_mode=fixed：保留 R_rod 的完整 6D 姿态（roll 也定死）。
+    if (roll_mode != "fixed") {
+      T_BASE_TCP = align_roll_to_current(T_BASE_TCP);
+    }
+
+    RCLCPP_INFO(logger,
+                "Bottle mouth in '%s': [%.3f, %.3f, %.3f], rod root target: [%.3f, %.3f, %.3f]",
+                planning_frame.c_str(),
+                p_mouth.x(), p_mouth.y(), p_mouth.z(),
+                T_BASE_TCP.translation().x(),
+                T_BASE_TCP.translation().y(),
+                T_BASE_TCP.translation().z());
+  } else {
+    // triangle：与原 hello_moveit / hello_moveit1 完全一致
+    T_BASE_TCP = T_BASE_OBJ * buildTcpOffsetTriangle();
+  }
+
+  // ============================================================
+  // IK 预检（走 move_group 的 /compute_ik 服务）
+  //
+  // 为什么不用本节点的 RobotState::setFromIK：
+  //   `ros2 run` 启动的节点上没有 robot_description_kinematics 参数，
+  //   MoveGroupInterface 在本进程加载的 RobotModel 没有 IK 插件
+  //   （日志 "No kinematics solver instantiated for group 'arm'"）。
+  //   真正的 pick_ik 在 move_group 进程里，直接调它的服务即可。
+  // ============================================================
+  const bool ik_check_enabled = node->has_parameter("ik_check")
+      ? node->get_parameter("ik_check").as_bool()
+      : true;
+  std::vector<double> q_goal;   // IK 解出来的关节角；有值时按关节空间目标规划
+  if (ik_check_enabled) {
+    const auto* jmg = move_group.getRobotModel()->getJointModelGroup("arm");
+    auto ik_client = node->create_client<moveit_msgs::srv::GetPositionIK>("/compute_ik");
+
+    if (!ik_client->wait_for_service(std::chrono::seconds(5))) {
+      RCLCPP_WARN(logger,
+                  "/compute_ik 服务不可用，跳过 IK 预检，直接按位姿目标规划。");
+    } else {
+      auto solve_ik = [&](const Eigen::Isometry3d& T, int timeout_sec) {
+        std::vector<double> q;
+        auto req = std::make_shared<moveit_msgs::srv::GetPositionIK::Request>();
+        req->ik_request.group_name = "arm";
+        req->ik_request.ik_link_name = "Tool_Link";
+        req->ik_request.pose_stamped.header.frame_id = planning_frame;
+        req->ik_request.pose_stamped.header.stamp = node->now();
+        req->ik_request.pose_stamped.pose = tf2::toMsg(T);
+        // 让 move_group 在自己的规划场景里检查碰撞（瓶子是 object_visualizer 加的
+        // 碰撞体）。这样 IK 有解基本就能规划过去，不会"有解但目标碰撞"。
+        req->ik_request.avoid_collisions = true;
+        req->ik_request.timeout = rclcpp::Duration(timeout_sec, 0);
+
+        auto future = ik_client->async_send_request(req);
+        if (future.wait_for(std::chrono::seconds(timeout_sec + 2)) != std::future_status::ready) {
+          RCLCPP_WARN(logger, "/compute_ik 调用超时");
+          return q;
+        }
+        const auto resp = future.get();
+        if (resp->error_code.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+          return q;
+        }
+
+        // 按本组变量顺序取出关节角
+        std::unordered_map<std::string, double> by_name;
+        const auto& js = resp->solution.joint_state;
+        for (size_t i = 0; i < js.name.size() && i < js.position.size(); ++i) {
+          by_name[js.name[i]] = js.position[i];
+        }
+        for (const auto& name : jmg->getVariableNames()) {
+          auto it = by_name.find(name);
+          if (it == by_name.end()) {
+            RCLCPP_WARN(logger, "/compute_ik 返回缺少关节 %s", name.c_str());
+            q.clear();
+            return q;
+          }
+          q.push_back(it->second);
+        }
+        return q;
+      };
+
+      // pick_ik 的 global 模式需要一点时间，给 2s
+      q_goal = solve_ik(T_BASE_TCP, 2);
+      if (q_goal.empty() && roll_mode != "fixed") {
+        // 最近的 roll 无解时，绕杆轴按 30° 步长换 roll 再试（joint 限位可能只放过某些 roll）
+        const Eigen::Vector3d rod_x = T_BASE_TCP.linear().col(0);
+        for (int i = 1; i <= 12 && q_goal.empty(); ++i) {
+          const double th = i * M_PI / 6.0;
+          Eigen::Isometry3d T = T_BASE_TCP;
+          T.linear() = Eigen::AngleAxisd(th, rod_x).toRotationMatrix() * T_BASE_TCP.linear();
+          q_goal = solve_ik(T, 1);
+          if (!q_goal.empty()) {
+            T_BASE_TCP = T;
+          }
+        }
+      }
+
+      if (q_goal.empty()) {
+        RCLCPP_ERROR(logger,
+            "IK pre-check: NO solution for this target (position + 瓶口法线方向, roll_mode=%s). "
+            "说明瓶子所在的位置/高度，当前臂以这个插入方向够不到。",
+            roll_mode.c_str());
+        RCLCPP_ERROR(logger,
+            "本目标 Tool_Link 原点为 [%.3f, %.3f, %.3f]。"
+            "+X 朝瓶子 -Z 时可用的经验范围约为 x ∈ [-0.26, 0.45]，"
+            "z ∈ [-0.22, 0.27]（base_link 下，FK 采样）；超出则挪瓶子/换瓶位。",
+            T_BASE_TCP.translation().x(), T_BASE_TCP.translation().y(),
+            T_BASE_TCP.translation().z());
+        rclcpp::shutdown();
+        spinner.join();
+        return 1;
+      }
+    }
+  }
+
   const geometry_msgs::msg::Pose tcp_target_pose = tf2::toMsg(T_BASE_TCP);
 
   RCLCPP_INFO(logger,
@@ -326,7 +521,15 @@ int main(int argc, char* argv[])
   // ============================================================
   // MoveIt 规划
   // ============================================================
-  move_group.setPoseTarget(tcp_target_pose);
+  move_group.setStartStateToCurrentState();
+  if (!q_goal.empty()) {
+    // 用 IK 解做关节空间目标（单点目标），比按位姿目标规划更容易成功。
+    move_group.setJointValueTarget(q_goal);
+    RCLCPP_INFO(logger, "Goal set: joint-space IK solution of the target pose.");
+  } else {
+    move_group.setPoseTarget(tcp_target_pose);
+    RCLCPP_INFO(logger, "Goal set: pose target (IK pre-check disabled).");
+  }
 
   prompt("Press 'Next' in RvizVisualToolsGui to start planning");
   draw_title("Planning...");
